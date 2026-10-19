@@ -1,0 +1,148 @@
+/**
+ * vision-translator plugin
+ * --------------------------
+ * 为纯文本模型（如不支持原生多模态的模型）提供"图片预分析"能力：
+ * 用户发送图片 → 调用 DashScope qwen3-vl-flash 视觉模型 → 转成文字描述 → 主模型"读"描述。
+ *
+ * API Key 读取优先级（绝不硬编码）：
+ *   1. 环境变量 QWEN_API_KEY
+ *   2. 环境变量 DASHSCOPE_API_KEY
+ *   3. 回退到 gitignored 安全文件 ~/.config/opencode/.env.local
+ *   若均缺失 → 保留原图片 part，不阻塞用户。
+ */
+
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { Plugin } from "@opencode-ai/plugin";
+
+const DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const VISION_MODEL = "qwen3-vl-flash";
+const DASHSCOPE_TIMEOUT_MS = 60_000;
+
+function getApiKey(): string | undefined {
+  if (process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY) {
+    return process.env.QWEN_API_KEY || process.env.DASHSCOPE_API_KEY;
+  }
+  try {
+    const envFile = join(homedir(), ".config/opencode/.env.local");
+    if (existsSync(envFile)) {
+      const content = readFileSync(envFile, "utf8");
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("QWEN_API_KEY=")) {
+          return trimmed.slice("QWEN_API_KEY=".length).trim();
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+const descriptionCache = new Map<string, string>();
+
+async function analyzeImage(dataUrl: string): Promise<string> {
+  const cached = descriptionCache.get(dataUrl);
+  if (cached) return cached;
+
+  const apiKey = getApiKey();
+  if (!apiKey) {
+    throw new Error("QWEN_API_KEY / DASHSCOPE_API_KEY 未配置");
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DASHSCOPE_TIMEOUT_MS);
+
+  try {
+    const resp = await fetch(`${DASHSCOPE_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: VISION_MODEL,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: dataUrl } },
+              {
+                type: "text",
+                text: "请详细描述这张图片的内容，包括画面主体、文字、图表、界面元素、颜色布局等所有可辨识的细节，用中文回答。",
+              },
+            ],
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      const errBody = await resp.text();
+      throw new Error(`DashScope API ${resp.status}: ${errBody.slice(0, 300)}`);
+    }
+
+    const data = (await resp.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const description =
+      data?.choices?.[0]?.message?.content || "(图片描述为空)";
+    descriptionCache.set(dataUrl, description);
+    return description;
+  } catch (e) {
+    if (controller.signal.aborted) {
+      throw new Error(`DashScope 分析超时（>${DASHSCOPE_TIMEOUT_MS / 1000}s）`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function translateParts(parts: Array<Record<string, any>>): Promise<void> {
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (
+      part?.type === "file" &&
+      part.mime?.startsWith("image/") &&
+      part.url?.startsWith("data:")
+    ) {
+      try {
+        const description = await analyzeImage(part.url);
+        parts[i] = {
+          id: part.id,
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          type: "text",
+          synthetic: true,
+          text: `[图片预分析 - ${part.filename || "image"}] ${description}`,
+        };
+      } catch (e) {
+        console.error("[vision-translator] 图片解析失败:", e);
+        parts[i] = {
+          id: part.id,
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          type: "text",
+          synthetic: true,
+          text: `[图片解析失败：${(e as Error).message}]（图片已降级为占位文本）`,
+        };
+      }
+    }
+  }
+}
+
+export const VisionTranslatorPlugin: Plugin = async () => {
+  return {
+    "experimental.chat.messages.transform": async (_input, output) => {
+      for (const msg of output.messages) {
+        if (msg?.parts && Array.isArray(msg.parts)) {
+          await translateParts(msg.parts);
+        }
+      }
+    },
+  };
+};
